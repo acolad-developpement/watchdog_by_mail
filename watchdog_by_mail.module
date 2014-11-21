@@ -1,0 +1,168 @@
+<?php
+
+/**
+ * @file
+ * Watchdog by mail module
+ */
+
+/**
+ * Implements hook_theme().
+ */
+function watchdog_by_mail_theme($existing, $type, $theme, $path) {
+  return array(
+    'watchdog_by_mail_items' => array(
+      'variables' => array('logs' => array()),
+    ),
+  );
+}
+
+/**
+ * Implementation of hook_cron()
+ */
+function watchdog_by_mail_cron() {
+  $recipents = variable_get('watchdog_by_mail_recipents', NULL);
+  $levels = variable_get('watchdog_by_mail_severity', array());
+  if (!$recipents || !$levels) {
+    return;
+  }
+
+  // Need to run ?
+  $last_run = variable_get('watchdog_by_mail_last_run', 0);
+  $frequency = variable_get('watchdog_by_mail_mail_frequency', 'days');
+  // Daily 
+  if($frequency !== 'hours') {
+    $first_run = variable_get('watchdog_by_mail_mail_first_run', 0);
+    if($frequency !== 'days' && $frequency !== date('l')) {
+      return;
+    }
+    if($first_run > date('H') || ($last_run && REQUEST_TIME - $last_run < 3600*24)) {
+      return;
+    }
+  }
+  // Hourly
+  else {
+    if($last_run && REQUEST_TIME - $last_run < 3600) {
+      return;
+    }
+  }
+
+  // Get logs to send
+  // @todo: check perf of this query, groupBy reeks
+  $frequency = variable_get('watchdog_by_mail_mail_frequency', 'days');
+  $query = db_select('watchdog', 'w');
+  $query->addExpression('SHA(CONCAT(message, variables))', 'strid');
+  $query->fields('w')
+        ->condition('w.severity', $levels)
+        ->condition('w.timestamp', $last_run, '>')
+        ->groupBy("strid")
+        ->orderBy('w.timestamp', 'DESC')
+        ->range(0, variable_get('watchdog_by_mail_max_entries', 500));
+  $query->addExpression('COUNT(w.wid)', 'ncount');
+  $count = $query->execute()->rowCount();
+  $logs = $query->execute()->fetchAll();
+
+  if($logs) {
+    $recipents  = explode(',', $recipents);
+    $recipents  = array_map('trim', $recipents);
+    $recipents  = array_filter($recipents);
+
+    // Create mail
+    $params = array(
+      'subject' => t('@count logs from !site_name', array('@count' => count($logs), '!site_name' => variable_get('site_name', NULL))),
+      'body'    => theme('watchdog_by_mail_items', array('logs' => $logs)),
+    );
+
+    // Send mail
+    foreach($recipents as $recipent) {
+      drupal_mail('watchdog_by_mail', 'watchdog_by_mail', $recipent, language_default(), $params);
+    }
+  }
+
+  variable_set('watchdog_by_mail_last_run', REQUEST_TIME);
+}
+
+/**
+ * Theme function
+ */
+function theme_watchdog_by_mail_items($variables) {
+  $output = '';
+  if(!$logs = $variables['logs']) {
+    return $output;
+  }
+
+  $severity = watchdog_severity_levels();
+  foreach($logs as $log) {
+    $message = theme('dblog_message', array('event' => $log));
+    $message = strip_tags($message);
+    $output .= '[' . $severity[$log->severity] . "] " . t($log->type) . " (" . t('@count times', array('@count' => $log->ncount)) . ")\n";
+    $output .= t('Message') . ': '  . truncate_utf8($message, 220, FALSE, TRUE) . "\n";
+    $output .= t('Location') . ': ' . $log->location . "\n";
+    $output .= t('Details') . ': ' . url('admin/reports/event/' . $log->wid, array('absolute' => TRUE)) . "\n\n";
+    $output .= t('Date') . ': ' . t(format_date($log->timestamp, 'short')) . "\n";
+  }
+  return check_plain($output);
+}
+
+/**
+ * Implementation of hook_mail()
+ */
+function watchdog_by_mail_mail($key, &$message, $params) {
+  if ($key == 'watchdog_by_mail') {
+    $message['subject'] = $params['subject'];
+    $message['body'] = array($params['body']);
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function watchdog_by_mail_form_system_logging_settings_alter(&$form, $form_state) {
+  $form['watchdog_by_mail'] = array(
+    '#type'         => 'fieldset',
+    '#title'        => t('Watchdog by mail'),
+    '#collapsible'  => TRUE,
+    '#collapsed'    => FALSE,
+  );
+  $form['watchdog_by_mail']['watchdog_by_mail_recipents'] = array(
+    '#type'           => 'textfield',
+    '#title'          => t('E-mail recipent(s)'),
+    '#default_value'  => variable_get('watchdog_by_mail_recipents', ''),
+    '#description'    => t('Recipents. Separate multiple e-mail addresses with comma, example: <em>info@example.com,watchdog@example.com</em>'),
+  );
+  $severity_options = watchdog_severity_levels();
+  $form['watchdog_by_mail']['watchdog_by_mail_severity'] = array(
+    '#type' => 'checkboxes',
+    '#multiple' => TRUE,
+    '#title' => t('Severity level treshold'),
+    '#default_value' => variable_get('watchdog_by_mail_severity', array('')),
+    '#options' => $severity_options,
+    '#description' => t('Severity levels to include in mail.'),
+  );
+  $form['watchdog_by_mail']['watchdog_by_mail_mail_frequency'] = array(
+    '#type' => 'select',
+    '#title' => t('Send mail every'),
+    '#default_value' => variable_get('watchdog_by_mail_mail_frequency', 'days'),
+    '#options' => drupal_map_assoc(array('hours', 'days', 'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'), 't'),
+    '#description' => t('Your cron frequency must match this setting.'),
+  );
+  $form['watchdog_by_mail']['watchdog_by_mail_mail_first_run'] = array(
+    '#type' => 'select',
+    '#title' => t('Starting at'),
+    '#default_value' => variable_get('watchdog_by_mail_mail_first_run', 0),
+    '#options' => drupal_map_assoc(array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23)),
+    '#field_suffix' => '',
+    '#states' => array(
+      'invisible' => array(
+        ':input[name="watchdog_by_mail_mail_frequency"]' => array(
+          array('value' => 'hours'),
+        ),
+      ),
+    ),
+  );
+  $form['watchdog_by_mail']['watchdog_by_mail_max_entries'] = array(
+    '#type' => 'select',
+    '#title' => t('Max entires to send per mail'),
+    '#default_value' => variable_get('watchdog_by_mail_max_entries', 500),
+    '#options' => drupal_map_assoc(array(10, 20, 30, 40, 50, 100, 200, 300, 400, 500, 1000, 2000)),
+  );
+}

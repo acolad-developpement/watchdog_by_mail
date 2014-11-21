@@ -1,0 +1,8 @@
+name = Watchdog by mail
+description = Send drupal logs by mail according to severities (hourly, daily or weekly)
+package = Monitoring
+version = "7.x-1.x"
+core = 7.x
+configure = admin/config/development/logging
+
+dependencies[] = dblog
